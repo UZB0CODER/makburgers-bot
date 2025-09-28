@@ -1,0 +1,13 @@
+Python tomonidan yaratilgan fayllar (keraksiz keshlar)
+*.pyc
+pycache/
+
+Virtual muhit papkasi (lokal kompyuteringizda turadi, GitHubga kerak emas)
+venv/
+env/
+
+IDE (VS Code) sozlamalari (faqat sizga tegishli)
+.vscode/
+
+Loyihaning o'zida yaratiladigan ma'lumotlar (Maxfiy/Kesh)
+user_data_cache.json
