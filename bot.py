@@ -1,35 +1,44 @@
-import logging
 import os
+import logging
 import json
 import asyncio
 import aiohttp
 from quart import Quart, request, jsonify
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from dotenv import load_dotenv
+
+# .env faylini yuklaymiz (faqat lokal ishlatish uchun)
+load_dotenv()
 
 # --- 1. SOZLAMALAR VA GLOBAL O'ZGARUVCHILAR ---
-TOKEN = os.environ.get('BOT_TOKEN', "8281338604:AAGAGLFoalXhGWShljAYe0Qxo6gkI86Avyg")
-ADMIN_ID = os.environ.get('ADMIN_ID', "880888292")
-WEB_HOST = os.environ.get('WEB_HOST')
+# BOT_TOKEN ni faqat os.getenv orqali olish tavsiya etiladi (xavfsizlik uchun)
+TOKEN = os.getenv('BOT_TOKEN')
+# ADMIN_ID ni int ga o'tkazish
+ADMIN_ID = int(os.getenv('ADMIN_ID', 0)) 
+WEB_HOST = os.getenv('WEB_HOST')
 
 # Quart app instance
 app = Quart(__name__)
+
+# Webhook manzilini yaratish
+# WEBHOOK_PATH Telegram PTB so'rovlarni qabul qilish uchun kerak
+WEBHOOK_PATH = f"/{TOKEN}" 
+WEBHOOK_URL = f"{WEB_HOST}{WEBHOOK_PATH}"
 
 # Basic logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global variables
-application = None  # Global telegram Application instance
-user_data = {}
+application = None 
 user_orders = {}
-USER_DATA_FILE = "user_data_cache.json"
+USER_DATA_FILE = "user_data_cache.json" # Foydalanuvchi ma'lumotlarini saqlash uchun fayl
 
 # -----------------
 # 1. BOT SOZLAMALARI
 # -----------------
 
-# Menyu bo'limlari va mahsulotlar (oldingidek)
 MENU = {
     "🍔 Fast Food": {
         "item_h": ("Hotdog", 15000), 
@@ -48,17 +57,13 @@ MENU = {
     }
 }
 
-# Barcha mahsulotlarning yagona lug'ati
 ALL_ITEMS = {}
 for category_name, items in MENU.items():
     for item_id, (name, price) in items.items():
         ALL_ITEMS[item_id] = (name, price, category_name)
 
 
-# Buyurtmalarni vaqtinchalik saqlash
-user_orders = {}
 # Foydalanuvchi ma'lumotlari: {user_id: {"phone": "+998xxxxxxxxx", "username": "..."}}
-# Ma'lumotlar bazasidan yoki fayldan yuklanadi
 user_data = {}
 
 
@@ -82,10 +87,34 @@ def get_order_summary(user_id: int) -> tuple[str, int]:
         
         item_total = count * price
         total_price += item_total
-        summary_text += f"    - {name} ({count}x) = {item_total} so'm\n"
+        summary_text += f"    - {name} ({count}x) = {item_total:,} so'm\n".replace(",", " ")
         
-    summary_text += f"\n💰 Jami: {total_price} so'm"
+    summary_text += f"\n💰 Jami: {total_price:,} so'm".replace(",", " ")
     return summary_text, total_price
+
+def load_users_from_file():
+    """Foydalanuvchi ma'lumotlarini JSON fayldan yuklaydi (Volume storage/Ephemeral diskda saqlash)."""
+    try:
+        if not os.path.exists(USER_DATA_FILE):
+             return {}
+        with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Kalitlarni int ga o'tkazish
+            return {int(k): v for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logger.error(f"Foydalanuvchi ma'lumotlarini yuklashda xato: {e}")
+        return {}
+
+def save_users_to_file():
+    """Foydalanuvchi ma'lumotlarini JSON faylga saqlaydi."""
+    try:
+        with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
+            # Kalitlarni str ga o'tkazish
+            json.dump(user_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Faylga saqlashda xato: {e}")
 
 # -----------------
 # 3. HANDLER FUNKSIYALARI
@@ -95,16 +124,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Boshlang'ich /start buyrug'ini bajaradi va raqam so'raydi."""
     user_id = update.effective_user.id
     
-    # 1. Ma'lumotlar bazasidan yoki keshdan tekshirish
-    is_registered = False
-    
-    # Biz lokal (JSON fayl) saqlashdan foydalanamiz
-    if user_id in user_data and "phone" in user_data[user_id]:
-        is_registered = True
+    is_registered = user_id in user_data and "phone" in user_data[user_id]
     
     # 2. Agar foydalanuvchi ro'yxatdan o'tgan bo'lsa, to'g'ridan-to'g'ri menyuni ko'rsatish
     if is_registered:
-        # Agar yangi user bo'lsa, buyurtma lug'atini ochish
         if user_id not in user_orders:
             user_orders[user_id] = {}
             
@@ -114,9 +137,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # 3. Ro'yxatdan o'tishni so'rash
     button = [[KeyboardButton("📱 Raqamni yuborish", request_contact=True)]]
-    # >>>>> T U Z A T I L D I <<<<<
     markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
-    # >>>>> T U Z A T I L D I <<<<<
+    
     await update.message.reply_text(
         "Ro‘yxatdan o‘tish va buyurtma berish uchun iltimos telefon raqamingizni yuboring:", 
         reply_markup=markup
@@ -128,14 +150,13 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = contact.phone_number.strip()
     user_id = update.effective_user.id
 
-    if phone.startswith("+"):
-        normalized_phone = phone[1:]
-    else:
-        normalized_phone = phone
+    # O'zbekiston raqamlarini tekshirish (faqat 998 bilan boshlanishi shart emas)
+    # Ammo formatni saqlaymiz.
+    if len(phone) >= 9: 
+        final_phone = phone
+        if not final_phone.startswith('+'):
+             final_phone = '+' + final_phone
         
-    if normalized_phone.startswith("998"):
-        final_phone = f"+{normalized_phone}" if not phone.startswith("+") else phone
-
         # Ma'lumotlarni saqlash
         user_data[user_id] = {
             "phone": final_phone,
@@ -144,13 +165,13 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         user_orders[user_id] = {}
         
-        # 4. Ma'lumotlarni doimiy saqlash
-        save_users_to_file() # Lokal faylga saqlash
+        # Ma'lumotlarni doimiy saqlash
+        save_users_to_file() 
 
         await update.message.reply_text("✅ Ro‘yxatdan o‘tish muvaffaqiyatli! Endi menyudan tanlang.")
         await show_main_menu(update, context)
     else:
-        await update.message.reply_text("❌ Faqat O‘zbekiston raqamlari (998 bilan boshlanuvchi) qabul qilinadi. Iltimos, raqamni qayta yuboring.")
+        await update.message.reply_text("❌ Raqam noto‘g‘ri formatda. Iltimos, raqamni qayta yuboring.")
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Asosiy menyuni ko'rsatish."""
@@ -162,10 +183,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "Asosiy menyu. Kerakli bo'limni tanlang:"
     
-    if update.message:
-        await update.message.reply_text(text, reply_markup=markup)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=markup)
+    message = update.message or update.callback_query.message
+    await message.reply_text(text, reply_markup=markup)
 
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,7 +222,7 @@ def create_item_buttons(category_name: str, user_id: int):
             InlineKeyboardButton("➕", callback_data=f"qty_inc:{item_id}")
         ]
         
-        row2 = [InlineKeyboardButton(f"{name} - {price} so'm", callback_data="ignore")]
+        row2 = [InlineKeyboardButton(f"{name} - {price:,} so'm".replace(",", " "), callback_data="ignore")]
         
         buttons.extend([row2, row1])
 
@@ -253,7 +272,8 @@ async def quantity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     category = context.user_data.get('current_category')
     if not category:
-        await show_categories(update, context)
+        # Agar category topilmasa, kategoriyalar menyusiga qaytaramiz
+        await show_categories(update, context) 
         return
 
     summary, _ = get_order_summary(user_id)
@@ -290,10 +310,13 @@ async def cart_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = f"{summary}\n\n---\n\n🛒 **Savatcha** menyusi. Buyurtmani rasmiylashtirasizmi?"
     
-    if query:
-        await message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    try:
+        if query:
+            await message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Savatchani ko'rsatishda xato: {e}")
 
 
 async def cart_clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,22 +349,27 @@ async def delivery_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":")[1]
+    
+    # Message ni to'g'ri olish
+    message = query.message
 
-    user_id = update.effective_user.id
+    context.user_data["delivery_choice"] = choice
     
     if choice == "yes":
         button = [[KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)]]
         markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
-        await query.edit_message_text("Manzil tanlanmoqda...")
         
-        await query.message.reply_text(
+        await message.edit_text("Manzil tanlanmoqda...")
+        
+        await message.reply_text(
             "📍 Yetkazib berish uchun iltimos, lokatsiyangizni yuboring:", 
             reply_markup=markup
         )
     else:
-        await query.edit_message_text("✅ Buyurtmangiz qabul qilindi! (Borib olish) Sizga tez orada aloqaga chiqamiz.")
+        await message.edit_text("✅ Buyurtmangiz qabul qilindi! (Borib olish) Sizga tez orada aloqaga chiqamiz.")
         await send_to_admin(update, context, "🏃 Borib olish")
-        await show_main_menu(update, context)
+        # Asosiy menyu tugmasini bosgandek ko'rsatamiz
+        await show_main_menu(update, context) 
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lokatsiyani qabul qilish va tasdiqlash."""
@@ -350,14 +378,17 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["temp_location"] = (lat, lon)
 
-    text = f"Buyurtma qilmoqchi bo‘lgan manzilingiz:\n\n**Xarita koordinatalari:**\nLat: `{lat}`\nLon: `{lon}`\n\nUshbu manzilni tasdiqlaysizmi? (Kuryerga aniqroq ma'lumot kerak bo'lsa, siz bilan bog'lanamiz)"
+    text = f"Buyurtma qilmoqchi bo‘lgan manzilingiz:\n\n**Xarita koordinatalari:**\nLat: `{lat}`\nLon: `{lon}`\n\nUshbu manzilni tasdiqlaysizmi? (Kuryerga aniqroq ma'lumot kerak bo'lsa, siz bilan bog‘lanamiz)"
     buttons = [
         [InlineKeyboardButton("✅ Ha, tasdiqlayman", callback_data="confirm:yes")],
         [InlineKeyboardButton("❌ Yo‘q, qaytadan yuborish", callback_data="confirm:no")]
     ]
     markup = InlineKeyboardMarkup(buttons)
 
-    await update.message.reply_location(latitude=lat, longitude=lon)
+    # ReplyKeyboardni yashirish
+    remove_markup = ReplyKeyboardMarkup([[""]], resize_keyboard=True, one_time_keyboard=True, selective=True)
+
+    await update.message.reply_location(latitude=lat, longitude=lon, reply_markup=remove_markup)
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,10 +398,11 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data.split(":")
 
     if data[1] == "yes":
-        await query.edit_message_text("✅ Manzil tasdiqlandi. Buyurtmangiz qabul qilindi!")
+        await query.edit_message_text("✅ Manzil tasdiqlandi. Buyurtmangiz qabul qilindi! Kuryer tez orada aloqaga chiqadi.")
         await send_to_admin(update, context, "🚖 Yetkazib berish (Lokatsiya bilan)")
         await show_main_menu(update, context)
     else:
+        # Lokatsiya qayta so'ralganda oldingi xabarni tahrirlash
         await query.edit_message_text("❌ Iltimos, lokatsiyani qaytadan to'g'ri yuboring.")
         button = [[KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)]]
         markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
@@ -399,16 +431,21 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, deli
 """
 
     try:
+        # Adminga buyurtma matnini yuborish
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
 
+        # Agar yetkazib berish bo'lsa, lokatsiyani alohida yuborish
         if delivery_type.startswith("🚖 Yetkazib berish") and "temp_location" in context.user_data:
             lat, lon = context.user_data["temp_location"]
             await context.bot.send_location(chat_id=ADMIN_ID, latitude=lat, longitude=lon)
         
+        # Buyurtma yakunlangandan so'ng savatchani tozalash
         user_orders[user_id] = {}
+        context.user_data.pop("temp_location", None) # Vaqtincha lokatsiyani o'chirish
         
     except Exception as e:
         logger.error(f"Adminga xabar yuborishda xatolik: {e}")
+        # Foydalanuvchiga xato haqida xabar berish
         await update.effective_message.reply_text("⚠️ Uzr, buyurtmani qabul qilishda texnik xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
 
 
@@ -426,34 +463,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🛒 Savatcha":
         await cart_view_handler(update, context)
     elif text == "📝 Fikr bildirish":
+        # Bu yerga fikr bildirish mantig'ini qo'shishingiz kerak
         await update.message.reply_text("Fikr-mulohazalaringizni shu yerga yozing. Biz uni albatta ko'rib chiqamiz!")
     elif text == "⚙️ Sozlamalar":
         await update.message.reply_text("Sozlamalar bo'limi hozircha tayyor emas.")
     else:
-        await update.message.reply_text("Kechirasiz, men sizni tushunmadim. Menyudan tanlang yoki /start buyrug'ini bosing.")
+        # Fikr bildirish rejimida bo'lmagan oddiy matnga javob
+        await update.message.reply_text("Kechirasiz, men sizni tushunmadim. Menyudan tanlang.")
 
 # -----------------
-# 4. BOTNI ISHGA TUSHIRISH
+# 4. BOTNI ISHGA TUSHIRISH VA WEBHOOK
 # -----------------
-
-def load_users_from_file():
-    """Foydalanuvchi ma'lumotlarini JSON fayldan yuklaydi."""
-    try:
-        with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
-            # Lug'at kalitlarini int ga o'tkazish
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_users_to_file():
-    """Foydalanuvchi ma'lumotlarini JSON faylga saqlaydi."""
-    try:
-        with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
-            # Lug'at kalitlarini str ga o'tkazish
-            json.dump(user_data, f, indent=4)
-    except Exception as e:
-        logger.error(f"Faylga saqlashda xato: {e}")
 
 def init_handlers(application: Application):
     """Handlerlarni bot ilovasiga qo'shish."""
@@ -473,45 +493,94 @@ def init_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(confirm_handler, pattern="^confirm:"))
     application.add_handler(CallbackQueryHandler(lambda update, context: update.callback_query.answer(), pattern="^ignore"))
 
-async def set_webhook_url(application: Application):
-    """Webhook URL'sini o'rnatish."""
-    url = f"{WEB_HOST}/{TOKEN}"
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook_handler():
+    """Telegramdan kelgan POST so'rovlarini qabul qilish."""
+    global application
+    if application:
+        # Quart orqali JSON so'rovini olish
+        data = await request.get_json()
+        
+        # So'rovni PTBga yuborish
+        update = Update.de_json(data, application.bot)
+        
+        # Yangilanishni asinxron tarzda qayta ishlash
+        await application.process_update(update)
     
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                logger.info("Webhook muvaffaqiyatli o'rnatildi.")
-            else:
-                logger.error(f"Webhook o'rnatishda xato: {response.status} {await response.text()}")
+    # Telegram har doim '200 OK' javobini kutadi
+    return jsonify({"status": "ok"})
+
+@app.route("/", methods=["GET"])
+async def home():
+    """Tekshirish uchun bosh sahifa."""
+    return f"Telegram Bot Ishlamoqda! Webhook URL: {WEBHOOK_URL}"
+
+
+async def set_webhook_url(application: Application):
+    """Webhook URL'sini o'rnatish. Bot ishga tushganda bir marta chaqiriladi."""
+    if not WEB_HOST:
+        logger.error("WEB_HOST topilmadi. Webhook o'rnatish bekor qilindi.")
+        return
+
+    # Webhookni o'rnatish uchun Telegram API'ga murojaat
+    try:
+        # Bu yerda application.bot.set_webhook() dan foydalanish tavsiya qilinadi
+        await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"✅ Webhook muvaffaqiyatli o'rnatildi: {WEBHOOK_URL}")
+
+        if ADMIN_ID > 0:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID, 
+                text=f"✅ Bot yangi Webhook manzilida ishga tushdi: {WEB_HOST}"
+            )
+
+    except Exception as e:
+        logger.error(f"❌ Webhook o'rnatishda PTB xatosi: {e}")
+
+async def startup():
+    """Quart ishga tushganda Webhookni o'rnatish."""
+    global application
+    if application:
+        await set_webhook_url(application)
+
 
 def main() -> Quart:
-    """Botni ishga tushirish funksiyasi."""
+    """Gunicorn uchun asosiy kirish nuqtasi. Bot Applicationni sozlaydi."""
     global application, user_data
     
     if not TOKEN:
-        logger.error("FATAL: BOT_TOKEN o'rnatilmagan!")
+        logger.error("FATAL: BOT_TOKEN o'rnatilmagan! Ilovani ishga tushirish bekor qilindi.")
         return app
         
-    # Load saved user data
+    # Foydalanuvchi ma'lumotlarini yuklash
     user_data = load_users_from_file()
     logger.info(f"Bot ma'lumotlari yuklandi. Jami foydalanuvchilar: {len(user_data)}")
 
-    # Initialize bot application
+    # Bot ilovasini yaratish
     application = Application.builder().token(TOKEN).build()
     init_handlers(application)
 
     if WEB_HOST:
-        # Webhook mode (for production)
+        # WEBHOOK rejimida ishga tushirish (Production uchun)
         logger.info("Bot WEBHOOK rejimida ishga tushmoqda.")
-        asyncio.create_task(set_webhook_url(application))
+        # Quart serveri ishga tushishidan oldin Webhookni o'rnatish
+        app.before_serving(startup)
         return app
     
-    # Polling mode (for local development)
-    logger.info("Bot POLLING rejimida ishga tushmoqda.")
+    # POLLING rejimida ishga tushirish (Lokal rivojlanish uchun)
+    logger.info("Bot POLLING rejimida ishga tushmoqda. (Faqat lokalda ishlaydi)")
+    # Lokal test qilish uchun ishlatiladigan joy
     application.run_polling(allowed_updates=Update.ALL_TYPES)
     return app
 
 if __name__ == "__main__":
+    # Lokal test qilishda faqatgina "main" funksiyasini chaqirish kifoya
     app = main()
     if WEB_HOST:
-        app.run()
+         # Productionda Gunicorn ishga tushiradi. Lokal test uchun esa bu qism ishlaydi.
+         # app.run()ni gunicorn/uvicorn ishlatadi
+         pass
+    else:
+        # Agar lokalda WEB_HOST o'rnatilmagan bo'lsa, polling ishlashi kerak
+        pass
