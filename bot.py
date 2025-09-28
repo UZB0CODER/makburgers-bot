@@ -1,359 +1,517 @@
 import logging
 import os
 import json
-from flask import Flask, request, jsonify
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
 import asyncio
-import requests
+import aiohttp
+from quart import Quart, request, jsonify
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# --- 1. SOZLAMALAR ---
-# Telegram bot tokenini va ADMIN ID ni o'rnating
-TOKEN = os.environ.get('BOT_TOKEN')
-# Agar WEB_HOST kiritilmagan bo'lsa, lokal Polling rejimida ishlash uchun None o'rnating
-WEB_HOST = os.environ.get('WEB_HOST') 
+# --- 1. SOZLAMALAR VA GLOBAL O'ZGARUVCHILAR ---
+TOKEN = os.environ.get('BOT_TOKEN', "8281338604:AAGAGLFoalXhGWShljAYe0Qxo6gkI86Avyg")
+ADMIN_ID = os.environ.get('ADMIN_ID', "880888292")
+WEB_HOST = os.environ.get('WEB_HOST')
 
-# Ma'lumotlarni saqlash fayli (lokal rejim uchun)
-USER_DATA_FILE = 'user_data_cache.json'
-FIRESTORE_ENABLED = False  # Firebase ishlatilmaydi
+# Quart app instance
+app = Quart(__name__)
 
-# Flask app ni yaratish
-app_flask = Flask(__name__)
-
-# Logging sozlamalari
+# Basic logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 2. GLOBAL MA'LUMOTLAR VA HOLAT ---
+# Global variables
+application = None  # Global telegram Application instance
 user_data = {}
-application = None # Global telegram Application instance
+user_orders = {}
+USER_DATA_FILE = "user_data_cache.json"
 
+# -----------------
+# 1. BOT SOZLAMALARI
+# -----------------
+
+# Menyu bo'limlari va mahsulotlar (oldingidek)
 MENU = {
-    "cat_fastfood": {
-        "name_uz": "🍔 Fast Food",
-        "items": {
-            "item_hotdog": ("Hotdog", 15000),
-            "item_lavash": ("Lavash", 25000),
-            "item_burger": ("Burger", 30000),
-        }
+    "🍔 Fast Food": {
+        "item_h": ("Hotdog", 15000), 
+        "item_l": ("Lavash", 25000), 
+        "item_b": ("Burger", 30000)
     },
-    "cat_drinks": {
-        "name_uz": "🥤 Ichimliklar",
-        "items": {
-            "item_cola": ("Coca Cola (1L)", 10000),
-            "item_fanta": ("Fanta (1L)", 9000),
-        }
+    "🥤 Ichimliklar": {
+        "item_p": ("Pepsi", 8000), 
+        "item_c": ("Cola", 8000), 
+        "item_f": ("Fanta", 8000)
+    },
+    "🍰 Desertlar": {
+        "item_ch": ("Cheesecake", 22000), 
+        "item_t": ("Tort", 35000), 
+        "item_d": ("Donut", 12000)
     }
 }
 
-# --- 3. MA'LUMOTLARNI SAQLASH FUNKSIYALARI (LOKAL REJIM UCHUN) ---
+# Barcha mahsulotlarning yagona lug'ati
+ALL_ITEMS = {}
+for category_name, items in MENU.items():
+    for item_id, (name, price) in items.items():
+        ALL_ITEMS[item_id] = (name, price, category_name)
 
-def load_users_from_file() -> dict:
-    """JSON fayldan foydalanuvchi ma'lumotlarini yuklaydi."""
-    if not os.path.exists(USER_DATA_FILE):
-        return {}
-    try:
-        with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    except Exception as e:
-        logger.error(f"Fayldan yuklashda xatolik: {e}")
-        return {}
 
-def save_users_to_file() -> None:
-    """Foydalanuvchi ma'lumotlarini JSON faylga saqlaydi."""
-    if not FIRESTORE_ENABLED:
-        try:
-            with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(user_data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            logger.error(f"Faylga saqlashda xatolik: {e}")
+# Buyurtmalarni vaqtinchalik saqlash
+user_orders = {}
+# Foydalanuvchi ma'lumotlari: {user_id: {"phone": "+998xxxxxxxxx", "username": "..."}}
+# Ma'lumotlar bazasidan yoki fayldan yuklanadi
+user_data = {}
 
-# --- 4. ASOSIY HANDLERLAR (Sizning bot mantiqingiz) ---
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Botni ishga tushirishda /start buyrug'ini qabul qiladi."""
-    chat_id = update.message.chat_id
+# -----------------
+# 2. YORDAMCHI FUNKSIYALAR
+# -----------------
+
+def get_order_summary(user_id: int) -> tuple[str, int]:
+    """Buyurtma ro'yxatini va umumiy summani hisoblaydi."""
+    orders = user_orders.get(user_id, {})
+    active_orders = {item_id: count for item_id, count in orders.items() if count > 0}
     
-    if chat_id not in user_data:
-        user_data[chat_id] = {'state': 'awaiting_contact', 'cart': {}, 'language': 'uz'}
-        save_users_to_file()
+    if not active_orders:
+        return "🛒 Siz hali buyurtma qo‘shmagansiz.", 0
 
-        keyboard = [
-            [KeyboardButton("📞 Mening raqamimni yuborish", request_contact=True)]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text("Ro'yxatdan o'tish uchun telefon raqamingizni yuboring:", reply_markup=reply_markup)
+    summary_text = "📦 Sizning buyurtmangiz:\n"
+    total_price = 0
+    
+    for item_id, count in active_orders.items():
+        name, price, _ = ALL_ITEMS.get(item_id, ("Noma'lum", 0, ""))
+        
+        item_total = count * price
+        total_price += item_total
+        summary_text += f"    - {name} ({count}x) = {item_total} so'm\n"
+        
+    summary_text += f"\n💰 Jami: {total_price} so'm"
+    return summary_text, total_price
+
+# -----------------
+# 3. HANDLER FUNKSIYALARI
+# -----------------
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Boshlang'ich /start buyrug'ini bajaradi va raqam so'raydi."""
+    user_id = update.effective_user.id
+    
+    # 1. Ma'lumotlar bazasidan yoki keshdan tekshirish
+    is_registered = False
+    
+    # Biz lokal (JSON fayl) saqlashdan foydalanamiz
+    if user_id in user_data and "phone" in user_data[user_id]:
+        is_registered = True
+    
+    # 2. Agar foydalanuvchi ro'yxatdan o'tgan bo'lsa, to'g'ridan-to'g'ri menyuni ko'rsatish
+    if is_registered:
+        # Agar yangi user bo'lsa, buyurtma lug'atini ochish
+        if user_id not in user_orders:
+            user_orders[user_id] = {}
+            
+        await update.message.reply_text(f"👋 Xush kelibsiz, {user_data[user_id]['username']}! Buyurtma berishni davom ettirishingiz mumkin.")
+        await show_main_menu(update, context)
         return
+        
+    # 3. Ro'yxatdan o'tishni so'rash
+    button = [[KeyboardButton("📱 Raqamni yuborish", request_contact=True)]]
+    # >>>>> T U Z A T I L D I <<<<<
+    markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
+    # >>>>> T U Z A T I L D I <<<<<
+    await update.message.reply_text(
+        "Ro‘yxatdan o‘tish va buyurtma berish uchun iltimos telefon raqamingizni yuboring:", 
+        reply_markup=markup
+    )
 
-    await show_main_menu(update, context)
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi kontakt raqamini qabul qiladi va saqlaydi."""
+    contact = update.message.contact
+    phone = contact.phone_number.strip()
+    user_id = update.effective_user.id
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Asosiy menyuni ko'rsatadi."""
-    chat_id = update.effective_chat.id
-    user_data[chat_id]['state'] = 'main_menu'
-    save_users_to_file()
-    
-    keyboard = [
+    if phone.startswith("+"):
+        normalized_phone = phone[1:]
+    else:
+        normalized_phone = phone
+        
+    if normalized_phone.startswith("998"):
+        final_phone = f"+{normalized_phone}" if not phone.startswith("+") else phone
+
+        # Ma'lumotlarni saqlash
+        user_data[user_id] = {
+            "phone": final_phone,
+            "username": update.effective_user.full_name,
+            "id": user_id
+        }
+        user_orders[user_id] = {}
+        
+        # 4. Ma'lumotlarni doimiy saqlash
+        save_users_to_file() # Lokal faylga saqlash
+
+        await update.message.reply_text("✅ Ro‘yxatdan o‘tish muvaffaqiyatli! Endi menyudan tanlang.")
+        await show_main_menu(update, context)
+    else:
+        await update.message.reply_text("❌ Faqat O‘zbekiston raqamlari (998 bilan boshlanuvchi) qabul qilinadi. Iltimos, raqamni qayta yuboring.")
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asosiy menyuni ko'rsatish."""
+    buttons = [
         ["🛍 Buyurtma berish", "🛒 Savatcha"],
         ["📝 Fikr bildirish", "⚙️ Sozlamalar"]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Asosiy menyu. Kerakli bo'limni tanlang:",
-        reply_markup=reply_markup
-    )
-
-async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telefon raqamini qabul qiladi va ro'yxatdan o'tkazadi."""
-    chat_id = update.message.chat_id
-    contact = update.message.contact
+    markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
     
-    if user_data.get(chat_id, {}).get('state') == 'awaiting_contact' and contact and contact.user_id == chat_id:
-        user_data[chat_id]['phone'] = contact.phone_number
-        user_data[chat_id]['state'] = 'registered'
-        save_users_to_file()
-        
-        await update.message.reply_text(f"Rahmat! Siz {contact.phone_number} raqami bilan muvaffaqiyatli ro'yxatdan o'tdingiz!")
-        await show_main_menu(update, context)
-        return
+    text = "Asosiy menyu. Kerakli bo'limni tanlang:"
+    
+    if update.message:
+        await update.message.reply_text(text, reply_markup=markup)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=markup)
 
-    await update.message.reply_text("Iltimos, avval /start buyrug'i orqali ro'yxatdan o'ting.")
 
-async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mahsulot kategoriyalarini ko'rsatadi."""
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mahsulot kategoriyalarini ko'rsatish."""
     query = update.callback_query
     if query:
         await query.answer()
-        chat_id = query.message.chat_id
-        message_id = query.message.message_id
-    else:
-        chat_id = update.message.chat_id
-        message_id = None 
 
-    user_data[chat_id]['state'] = 'selecting_category'
-    save_users_to_file()
+    buttons = [[InlineKeyboardButton(f"🍱 {cat}", callback_data=f"cat:{cat}")] for cat in MENU.keys()]
+    buttons.append([InlineKeyboardButton("🛒 Savatcha | Tasdiqlash", callback_data="cart:view")])
+    markup = InlineKeyboardMarkup(buttons)
     
-    keyboard = []
-    for key, data in MENU.items():
-        keyboard.append([InlineKeyboardButton(data['name_uz'], callback_data=f"cat:{key}")])
+    user_id = update.effective_user.id
+    summary, _ = get_order_summary(user_id)
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = "Kategoriyani tanlang:"
+    text = f"{summary}\n\n---\n\n📋 Menyu kategoriyasini tanlang:"
     
     if query:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+def create_item_buttons(category_name: str, user_id: int):
+    """Mahsulotlar ro'yxati, + / - / count tugmalari va Orqaga tugmasini yaratadi."""
+    orders = user_orders.get(user_id, {})
+    buttons = []
+    
+    for item_id, (name, price) in MENU[category_name].items():
+        count = orders.get(item_id, 0)
+        
+        row1 = [
+            InlineKeyboardButton("➖", callback_data=f"qty_dec:{item_id}"),
+            InlineKeyboardButton(f" {count} ", callback_data="ignore"),
+            InlineKeyboardButton("➕", callback_data=f"qty_inc:{item_id}")
+        ]
+        
+        row2 = [InlineKeyboardButton(f"{name} - {price} so'm", callback_data="ignore")]
+        
+        buttons.extend([row2, row1])
+
+    buttons.append([InlineKeyboardButton("⬅️ Barcha kategoriyalar", callback_data="back:categories")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+
+async def category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kategoriyani tanlash. Mahsulotlar ro'yxatini chiqaradi."""
+    query = update.callback_query
+    await query.answer()
+    category = query.data.split(":")[1]
+    user_id = query.from_user.id
+
+    context.user_data['current_category'] = category
+    
+    summary, _ = get_order_summary(user_id)
+    markup = create_item_buttons(category, user_id)
+    
+    text = f"{summary}\n\n---\n\n**{category}** bo‘limi. Nechta kerakligini tanlang:"
+    
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def quantity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mahsulot sonini + yoki - tugmasi orqali o'zgartirish."""
+    query = update.callback_query
+    await query.answer()
+    
+    action, item_id = query.data.split(":")
+    user_id = query.from_user.id
+    
+    if user_id not in user_orders:
+        user_orders[user_id] = {}
+        
+    current_count = user_orders[user_id].get(item_id, 0)
+    
+    if action == "qty_inc":
+        new_count = current_count + 1
+    elif action == "qty_dec":
+        new_count = max(0, current_count - 1)
+    else:
+        return
+
+    user_orders[user_id][item_id] = new_count
+    
+    category = context.user_data.get('current_category')
+    if not category:
+        await show_categories(update, context)
+        return
+
+    summary, _ = get_order_summary(user_id)
+    markup = create_item_buttons(category, user_id)
+    
+    text = f"{summary}\n\n---\n\n**{category}** bo‘limi. Nechta kerakligini tanlang:"
+    
+    await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def cart_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Savatchani ko'rsatish va buyurtmani tasdiqlash tugmalarini chiqarish."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.message
+    
+    user_id = update.effective_user.id
+    summary, total = get_order_summary(user_id)
+    
+    has_items = total > 0
+    
+    buttons = []
+    if has_items:
+        buttons = [
+            [InlineKeyboardButton("✅ Tasdiqlash va manzilni tanlash", callback_data="checkout:start")],
+            [InlineKeyboardButton("🗑 Savatchani tozalash", callback_data="cart:clear")],
+        ]
+    
+    buttons.append([InlineKeyboardButton("⬅️ Kategoriyalarga qaytish", callback_data="back:categories")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    text = f"{summary}\n\n---\n\n🛒 **Savatcha** menyusi. Buyurtmani rasmiylashtirasizmi?"
+    
+    if query:
+        await message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def cart_clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Savatchani tozlash."""
+    query = update.callback_query
+    await query.answer("Savatcha tozalandi.")
+    user_id = query.from_user.id
+    
+    if user_id in user_orders:
+        user_orders[user_id] = {}
+        
+    await show_categories(update, context)
+
+
+async def checkout_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buyurtmani rasmiylashtirish. Yetkazib berish turini so'raydi."""
+    query = update.callback_query
+    await query.answer()
+
+    buttons = [
+        [InlineKeyboardButton("🚖 Yetkazib berish", callback_data="delivery:yes")],
+        [InlineKeyboardButton("🏃 Borib olish", callback_data="delivery:no")]
+    ]
+    markup = InlineKeyboardMarkup(buttons)
+
+    await query.edit_message_text("Qanday usulni tanlaysiz?", reply_markup=markup)
+
+async def delivery_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yetkazib berish turini qabul qilish."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+
+    user_id = update.effective_user.id
+    
+    if choice == "yes":
+        button = [[KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)]]
+        markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
+        await query.edit_message_text("Manzil tanlanmoqda...")
+        
+        await query.message.reply_text(
+            "📍 Yetkazib berish uchun iltimos, lokatsiyangizni yuboring:", 
+            reply_markup=markup
         )
     else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup
-        )
+        await query.edit_message_text("✅ Buyurtmangiz qabul qilindi! (Borib olish) Sizga tez orada aloqaga chiqamiz.")
+        await send_to_admin(update, context, "🏃 Borib olish")
+        await show_main_menu(update, context)
 
-async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Manzil qabul qilindi. Buyurtmani rasmiylashtirish davom etmoqda...")
+async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lokatsiyani qabul qilish va tasdiqlash."""
+    location = update.message.location
+    lat, lon = location.latitude, location.longitude
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["temp_location"] = (lat, lon)
+
+    text = f"Buyurtma qilmoqchi bo‘lgan manzilingiz:\n\n**Xarita koordinatalari:**\nLat: `{lat}`\nLon: `{lon}`\n\nUshbu manzilni tasdiqlaysizmi? (Kuryerga aniqroq ma'lumot kerak bo'lsa, siz bilan bog'lanamiz)"
+    buttons = [
+        [InlineKeyboardButton("✅ Ha, tasdiqlayman", callback_data="confirm:yes")],
+        [InlineKeyboardButton("❌ Yo‘q, qaytadan yuborish", callback_data="confirm:no")]
+    ]
+    markup = InlineKeyboardMarkup(buttons)
+
+    await update.message.reply_location(latitude=lat, longitude=lon)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manzilni tasdiqlash va buyurtmani yakunlash."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split(":")
+
+    if data[1] == "yes":
+        await query.edit_message_text("✅ Manzil tasdiqlandi. Buyurtmangiz qabul qilindi!")
+        await send_to_admin(update, context, "🚖 Yetkazib berish (Lokatsiya bilan)")
+        await show_main_menu(update, context)
+    else:
+        await query.edit_message_text("❌ Iltimos, lokatsiyani qaytadan to'g'ri yuboring.")
+        button = [[KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)]]
+        markup = ReplyKeyboardMarkup(button, resize_keyboard=True, one_time_keyboard=True)
+        await query.message.reply_text("📍 Iltimos, lokatsiyangizni yuboring:", reply_markup=markup)
+
+async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, delivery_type: str):
+    """Yakuniy buyurtmani adminga yuboradi."""
+    user_id = update.effective_user.id
+    
+    user_info = user_data.get(user_id, {})
+    phone = user_info.get("phone", "Raqam topilmadi")
+    username = user_info.get("username", update.effective_user.full_name)
+    
+    summary, total = get_order_summary(user_id)
+    
+    text = f"""
+🚨 **Yangi Buyurtma!** 🚨
+
+👤 **Mijoz:** {username}
+📞 **Raqam:** `{phone}`
+🆔 **User ID:** `{user_id}`
+
+{summary}
+
+🚚 **Yetkazib berish turi:** {delivery_type}
+"""
+
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
+
+        if delivery_type.startswith("🚖 Yetkazib berish") and "temp_location" in context.user_data:
+            lat, lon = context.user_data["temp_location"]
+            await context.bot.send_location(chat_id=ADMIN_ID, latitude=lat, longitude=lon)
+        
+        user_orders[user_id] = {}
+        
+    except Exception as e:
+        logger.error(f"Adminga xabar yuborishda xatolik: {e}")
+        await update.effective_message.reply_text("⚠️ Uzr, buyurtmani qabul qilishda texnik xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Matn xabarlarni qabul qilish (Asosiy menyu tugmalarini ushlash)."""
     text = update.message.text
+    user_id = update.effective_user.id
+    
+    if user_id not in user_data or "phone" not in user_data[user_id]:
+        await update.message.reply_text("Iltimos, avval /start buyrug'i orqali ro'yxatdan o'ting.")
+        return
+
     if text == "🛍 Buyurtma berish":
         await show_categories(update, context)
     elif text == "🛒 Savatcha":
-        await cart_view_handler(update, context, is_text_command=True)
-    elif text == "⬅️ Orqaga" or text == "❌ Bekor qilish":
-        await show_main_menu(update, context)
+        await cart_view_handler(update, context)
+    elif text == "📝 Fikr bildirish":
+        await update.message.reply_text("Fikr-mulohazalaringizni shu yerga yozing. Biz uni albatta ko'rib chiqamiz!")
+    elif text == "⚙️ Sozlamalar":
+        await update.message.reply_text("Sozlamalar bo'limi hozircha tayyor emas.")
     else:
-        await update.message.reply_text("Tushunmadim. Asosiy menyudan tanlang.")
+        await update.message.reply_text("Kechirasiz, men sizni tushunmadim. Menyudan tanlang yoki /start buyrug'ini bosing.")
 
-async def category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    category_key = query.data.split(':')[1]
-    
-    text = f"**{MENU[category_key]['name_uz']}** bo'limi."
-    keyboard = []
-    
-    for item_key, item_data in MENU[category_key]['items'].items():
-        name, price = item_data
-        keyboard.append([
-            InlineKeyboardButton(f"{name} - {price:,} so'm", callback_data=f"add:{item_key}")
-        ])
+# -----------------
+# 4. BOTNI ISHGA TUSHIRISH
+# -----------------
 
-    keyboard.append([InlineKeyboardButton("⬅️ Bosh menyuga", callback_data="back:categories")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
+def load_users_from_file():
+    """Foydalanuvchi ma'lumotlarini JSON fayldan yuklaydi."""
+    try:
+        with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
+            # Lug'at kalitlarini int ga o'tkazish
+            data = json.load(f)
+            return {int(k): v for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-    await query.edit_message_text(
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+def save_users_to_file():
+    """Foydalanuvchi ma'lumotlarini JSON faylga saqlaydi."""
+    try:
+        with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
+            # Lug'at kalitlarini str ga o'tkazish
+            json.dump(user_data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Faylga saqlashda xato: {e}")
 
-async def quantity_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("Miqdor o'zgartirildi (Mantiq qo'shilishi kerak).")
-
-async def cart_view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, is_text_command=False) -> None:
-    chat_id = update.effective_chat.id
-    cart = user_data.get(chat_id, {}).get('cart', {})
-    
-    text = "🛒 **Savatchangiz:**\n\n"
-    total_price = 0
-    
-    if not cart:
-        text += "Savatchangiz bo'sh. Buyurtma berish bo'limidan mahsulot tanlang."
-        keyboard = [[InlineKeyboardButton("🛍 Buyurtma berish", callback_data="back:categories")]]
-    else:
-        for item_key, qty in cart.items():
-            item_name = "Noma'lum mahsulot"
-            item_price = 0
-            for category_key, category_data in MENU.items():
-                if item_key in category_data['items']:
-                    item_name, item_price = category_data['items'][item_key]
-                    break
-            
-            sub_total = qty * item_price
-            total_price += sub_total
-            
-            text += f"▪️ {item_name} x {qty} dona = {sub_total:,} so'm\n"
+def init_handlers(application: Application):
+    """Handlerlarni bot ilovasiga qo'shish."""
+    application.add_handler(CommandHandler("start", start_command))
         
-        text += f"\n**Jami: {total_price:,} so'm**"
-        
-        keyboard = [
-            [InlineKeyboardButton("✅ Rasmiylashtirish", callback_data="checkout:start")],
-            [InlineKeyboardButton("🗑 Savatchani tozalash", callback_data="cart:clear")],
-            [InlineKeyboardButton("⬅️ Qo'shishni davom etish", callback_data="back:categories")]
-        ]
+    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    application.add_handler(MessageHandler(filters.LOCATION, location_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    application.add_handler(CallbackQueryHandler(show_categories, pattern="^back:categories"))
+    application.add_handler(CallbackQueryHandler(category_handler, pattern="^cat:"))
+    application.add_handler(CallbackQueryHandler(quantity_handler, pattern="^qty_(inc|dec):"))
+    application.add_handler(CallbackQueryHandler(cart_view_handler, pattern="^cart:view"))
+    application.add_handler(CallbackQueryHandler(cart_clear_handler, pattern="^cart:clear"))
+    application.add_handler(CallbackQueryHandler(checkout_start_handler, pattern="^checkout:start"))
+    application.add_handler(CallbackQueryHandler(delivery_handler, pattern="^delivery:"))
+    application.add_handler(CallbackQueryHandler(confirm_handler, pattern="^confirm:"))
+    application.add_handler(CallbackQueryHandler(lambda update, context: update.callback_query.answer(), pattern="^ignore"))
+
+async def set_webhook_url(application: Application):
+    """Webhook URL'sini o'rnatish."""
+    url = f"{WEB_HOST}/{TOKEN}"
     
-    if is_text_command:
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-async def cart_clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    
-    user_data[chat_id]['cart'] = {}
-    save_users_to_file()
-    
-    await query.answer("Savatcha tozalandi.")
-    await show_categories(update, context)
-
-async def checkout_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("Buyurtmani rasmiylashtirish (Mantiq qo'shilishi kerak).")
-    await query.edit_message_text("Manzilingizni yuboring.")
-
-async def delivery_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pass
-
-async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pass
-
-@app_flask.route(f'/{TOKEN}', methods=['POST'])
-async def webhook():
-    """Telegramdan kelgan yangilanishlarni (webhook) qayta ishlaydi."""
-    if request.method == "POST":
-        update_json = request.get_json(force=True)
-        # Webhook handler asinxron bo'lishi kerak. Bu yerda application.process_update() asinxron funksiyasini chaqiramiz.
-        await application.process_update(Update.de_json(update_json, application.bot))
-        return jsonify({"status": "ok"}), 200
-    return jsonify({"status": "method not allowed"}), 405
-
-@app_flask.route('/')
-def home():
-    """Saytning asosiy sahifasi (Tekshirish uchun)."""
-    return "Makburgers Bot veb-xizmati ishlamoqda!", 200
-
-# --- 5. BOTNI ISHGA TUSHIRISH FUNKSIYASI ---
-
-def init_handlers(app: Application) -> None:
-    """Handlerlarni Application ob'ektiga qo'shadi."""
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
-    app.add_handler(MessageHandler(filters.LOCATION, location_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(CallbackQueryHandler(show_categories, pattern="^back:categories"))
-    app.add_handler(CallbackQueryHandler(category_handler, pattern="^cat:"))
-    app.add_handler(CallbackQueryHandler(quantity_handler, pattern="^qty_(inc|dec):"))
-    app.add_handler(CallbackQueryHandler(cart_view_handler, pattern="^cart:view"))
-    app.add_handler(CallbackQueryHandler(cart_clear_handler, pattern="^cart:clear"))
-    app.add_handler(CallbackQueryHandler(checkout_start_handler, pattern="^checkout:start"))
-    app.add_handler(CallbackQueryHandler(delivery_handler, pattern="^delivery:"))
-    app.add_handler(CallbackQueryHandler(confirm_handler, pattern="^confirm:"))
-    app.add_handler(CallbackQueryHandler(lambda update, context: asyncio.create_task(update.callback_query.answer()), pattern="^ignore"))
-
-
-async def set_webhook(app: Application) -> None:
-    """Telegramda Webhook URL'ni o'rnatadi."""
-    if not TOKEN:
-        logger.error("BOT_TOKEN kiritilmagan!")
-        return
-        
-    if WEB_HOST and WEB_HOST.startswith('https://'):
-        WEBHOOK_FULL_URL = f"{WEB_HOST}{TOKEN}"
-        
-        # Requests kutubxonasi yordamida Webhook o'rnatish
-        telegram_set_webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-        try:
-            response = requests.post(telegram_set_webhook_url, json={'url': WEBHOOK_FULL_URL})
-            
-            if response.status_code == 200 and response.json().get('ok'):
-                 logger.info(f"Webhook muvaffaqiyatli o'rnatildi: {WEBHOOK_FULL_URL}")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                logger.info("Webhook muvaffaqiyatli o'rnatildi.")
             else:
-                 logger.error(f"Webhook o'rnatishda xato: {response.text}")
-        except Exception as e:
-            logger.error(f"Webhook o'rnatish uchun API chaqiruvida xato: {e}")
+                logger.error(f"Webhook o'rnatishda xato: {response.status} {await response.text()}")
 
-def main() -> Flask:
-    """Botni ishga tushirish funksiyasi (Railway tomonidan chaqiriladi)."""
+def main() -> Quart:
+    """Botni ishga tushirish funksiyasi."""
     global application, user_data
     
     if not TOKEN:
-        logger.error("FATAL: BOT_TOKEN muhit o'zgaruvchisi o'rnatilmagan. Iltimos, Railway'da sozlang.")
-        # Agar tokenni topa olmasa, bo'sh Flask ilovasini qaytaradi
-        return app_flask
+        logger.error("FATAL: BOT_TOKEN o'rnatilmagan!")
+        return app
         
-    # Ma'lumotlarni yuklash (Serverga joylashish uchun ham, lokal ishga tushirish uchun ham)
+    # Load saved user data
     user_data = load_users_from_file()
     logger.info(f"Bot ma'lumotlari yuklandi. Jami foydalanuvchilar: {len(user_data)}")
 
-    # Telegram Application ob'ektini yaratish
-    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    # Initialize bot application
+    application = Application.builder().token(TOKEN).build()
     init_handlers(application)
 
     if WEB_HOST:
-        # WEBHOOK rejimi (Railway uchun)
-        logger.info("Bot Webhook rejimida ishga tushmoqda.")
-        
-        # set_webhook ni asinxron ishga tushirish kerak, chunki main() sinkron chaqiriladi
-        asyncio.run(set_webhook(application))
+        # Webhook mode (for production)
+        logger.info("Bot WEBHOOK rejimida ishga tushmoqda.")
+        asyncio.create_task(set_webhook_url(application))
+        return app
+    
+    # Polling mode (for local development)
+    logger.info("Bot POLLING rejimida ishga tushmoqda.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
 
-        # Waitress serveri Flask app_flask obyektini chaqiradi va u ishga tushadi
-        return app_flask
-    else:
-        # POLLING rejimi (Lokal kompyuter uchun)
-        logger.warning("WEB_HOST o'rnatilmagan. Lokal (Polling) rejimida ishga tushmoqda.")
-        try:
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
-        except KeyboardInterrupt:
-            logger.info("Polling to'xtatildi (Ctrl+C).")
-        finally:
-            save_users_to_file()
-            
 if __name__ == "__main__":
-    main()
+    app = main()
+    if WEB_HOST:
+        app.run()
